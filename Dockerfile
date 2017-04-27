@@ -1,18 +1,18 @@
-FROM golang:1.7-alpine
+FROM alpine:latest
+MAINTAINER tinyproxy <tinyproxy@gmail.com>
 
-ENV DISTRIBUTION_DIR /go/src/github.com/docker/distribution
-ENV DOCKER_BUILDTAGS include_oss include_gcs
+RUN echo "https://mirrors.ustc.edu.cn/alpine/v3.5/main" > /etc/apk/repositories
+RUN echo "https://mirrors.ustc.edu.cn/alpine/v3.5/community" >> /etc/apk/repositories
+RUN apk update
+RUN apk --update upgrade && \
+    apk add curl ca-certificates wget && \
+    update-ca-certificates && \
+    rm -rf /var/cache/apk/*
 
-RUN set -ex \
-    && apk add --no-cache make git
-
-WORKDIR $DISTRIBUTION_DIR
-COPY . $DISTRIBUTION_DIR
-COPY cmd/registry/config-dev.yml /etc/docker/registry/config.yml
-
-RUN make PREFIX=/go clean binaries
-
-VOLUME ["/var/lib/registry"]
+RUN mkdir -p /opt/
+WORKDIR /opt/
+COPY cmd/registry/registry /opt/registry
 EXPOSE 5000
-ENTRYPOINT ["registry"]
-CMD ["serve", "/etc/docker/registry/config.yml"]
+
+CMD /opt/registry serve /opt/config.yml
+

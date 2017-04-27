@@ -55,6 +55,7 @@ type DriverParameters struct {
 	ChunkSize       int64
 	RootDirectory   string
 	Endpoint        string
+	InternalIO 		bool
 }
 
 func init() {
@@ -71,9 +72,17 @@ func (factory *ossDriverFactory) Create(parameters map[string]interface{}) (stor
 type driver struct {
 	Client        *oss.Client
 	Bucket        *oss.Bucket
+	InternalBucket *oss.Bucket
 	ChunkSize     int64
 	Encrypt       bool
 	RootDirectory string
+}
+
+func (d *driver) smartBucket()(*oss.Bucket){
+	if d.InternalBucket != nil {
+		return d.InternalBucket
+	}
+	return d.Bucket
 }
 
 type baseEmbed struct {
@@ -175,6 +184,11 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		endpoint = ""
 	}
 
+	internalIOBool := false
+	if internalIO, ok := parameters["internalio"]; ok {
+		internalIOBool, _ = internalIO.(bool)
+	}
+
 	params := DriverParameters{
 		AccessKeyID:     fmt.Sprint(accessKey),
 		AccessKeySecret: fmt.Sprint(secretKey),
@@ -186,6 +200,7 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		Secure:          secureBool,
 		Internal:        internalBool,
 		Endpoint:        fmt.Sprint(endpoint),
+		InternalIO: 	 internalIOBool,
 	}
 
 	return New(params)
@@ -206,6 +221,16 @@ func New(params DriverParameters) (*Driver, error) {
 		return nil, err
 	}
 
+	var internalBucket *oss.Bucket
+
+	if !params.Internal && params.InternalIO {
+		logrus.Info("enable internal bucket IO")
+		internalClient := oss.NewOSSClient(params.Region, params.Internal, params.AccessKeyID, params.AccessKeySecret, params.Secure)
+		client.SetEndpoint(params.Endpoint)
+		internalBucket = internalClient.Bucket(params.Bucket)
+		internalClient.SetDebug(false)
+	}
+
 	// TODO(tg123): Currently multipart uploads have no timestamps, so this would be unwise
 	// if you initiated a new OSS client while another one is running on the same bucket.
 
@@ -215,6 +240,7 @@ func New(params DriverParameters) (*Driver, error) {
 		ChunkSize:     params.ChunkSize,
 		Encrypt:       params.Encrypt,
 		RootDirectory: params.RootDirectory,
+		InternalBucket: internalBucket,
 	}
 
 	return &Driver{
@@ -234,7 +260,7 @@ func (d *driver) Name() string {
 
 // GetContent retrieves the content stored at "path" as a []byte.
 func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
-	content, err := d.Bucket.Get(d.ossPath(path))
+	content, err := d.smartBucket().Get(d.ossPath(path))
 	if err != nil {
 		return nil, parseError(path, err)
 	}
@@ -243,16 +269,17 @@ func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
 
 // PutContent stores the []byte content at a location designated by "path".
 func (d *driver) PutContent(ctx context.Context, path string, contents []byte) error {
-	return parseError(path, d.Bucket.Put(d.ossPath(path), contents, d.getContentType(), getPermissions(), d.getOptions()))
+	return parseError(path, d.smartBucket().Put(d.ossPath(path), contents, d.getContentType(), getPermissions(), d.getOptions()))
 }
 
 // Reader retrieves an io.ReadCloser for the content stored at "path" with a
 // given byte offset.
 func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.ReadCloser, error) {
+
 	headers := make(http.Header)
 	headers.Add("Range", "bytes="+strconv.FormatInt(offset, 10)+"-")
 
-	resp, err := d.Bucket.GetResponseWithHeaders(d.ossPath(path), headers)
+	resp, err := d.smartBucket().GetResponseWithHeaders(d.ossPath(path), headers)
 	if err != nil {
 		return nil, parseError(path, err)
 	}
@@ -272,16 +299,17 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 // Writer returns a FileWriter which will store the content written to it
 // at the location designated by "path" after the call to Commit.
 func (d *driver) Writer(ctx context.Context, path string, append bool) (storagedriver.FileWriter, error) {
+	ioBucket := d.smartBucket()
 	key := d.ossPath(path)
 	if !append {
 		// TODO (brianbland): cancel other uploads at this path
-		multi, err := d.Bucket.InitMulti(key, d.getContentType(), getPermissions(), d.getOptions())
+		multi, err := ioBucket.InitMulti(key, d.getContentType(), getPermissions(), d.getOptions())
 		if err != nil {
 			return nil, err
 		}
 		return d.newWriter(key, multi, nil), nil
 	}
-	multis, _, err := d.Bucket.ListMulti(key, "")
+	multis, _, err := ioBucket.ListMulti(key, "")
 	if err != nil {
 		return nil, parseError(path, err)
 	}
@@ -305,7 +333,7 @@ func (d *driver) Writer(ctx context.Context, path string, append bool) (storaged
 // Stat retrieves the FileInfo for the given path, including the current size
 // in bytes and the creation time.
 func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
-	listResponse, err := d.Bucket.List(d.ossPath(path), "", "", 1)
+	listResponse, err := d.smartBucket().List(d.ossPath(path), "", "", 1)
 	if err != nil {
 		return nil, err
 	}
@@ -351,8 +379,10 @@ func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
 		prefix = "/"
 	}
 
+	ioBucket := d.smartBucket()
+
 	ossPath := d.ossPath(path)
-	listResponse, err := d.Bucket.List(ossPath, "/", "", listMax)
+	listResponse, err := ioBucket.List(ossPath, "/", "", listMax)
 	if err != nil {
 		return nil, parseError(opath, err)
 	}
@@ -370,7 +400,7 @@ func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
 		}
 
 		if listResponse.IsTruncated {
-			listResponse, err = d.Bucket.List(ossPath, "/", listResponse.NextMarker, listMax)
+			listResponse, err = ioBucket.List(ossPath, "/", listResponse.NextMarker, listMax)
 			if err != nil {
 				return nil, err
 			}
@@ -401,7 +431,7 @@ const maxConcurrency = 10
 // object.
 func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) error {
 	logrus.Infof("Move from %s to %s", d.ossPath(sourcePath), d.ossPath(destPath))
-	err := d.Bucket.CopyLargeFileInParallel(d.ossPath(sourcePath), d.ossPath(destPath),
+	err := d.smartBucket().CopyLargeFileInParallel(d.ossPath(sourcePath), d.ossPath(destPath),
 		d.getContentType(),
 		getPermissions(),
 		oss.Options{},
@@ -416,8 +446,9 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 
 // Delete recursively deletes all objects stored at "path" and its subpaths.
 func (d *driver) Delete(ctx context.Context, path string) error {
+	ioBucket := d.smartBucket()
 	ossPath := d.ossPath(path)
-	listResponse, err := d.Bucket.List(ossPath, "", "", listMax)
+	listResponse, err := ioBucket.List(ossPath, "", "", listMax)
 	if err != nil || len(listResponse.Contents) == 0 {
 		return storagedriver.PathNotFoundError{Path: path}
 	}
@@ -435,7 +466,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 			ossObjects[index].Key = key.Key
 		}
 
-		err := d.Bucket.DelMulti(oss.Delete{Quiet: false, Objects: ossObjects[0:numOssObjects]})
+		err := ioBucket.DelMulti(oss.Delete{Quiet: false, Objects: ossObjects[0:numOssObjects]})
 		if err != nil {
 			return nil
 		}
@@ -444,7 +475,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 			return nil
 		}
 
-		listResponse, err = d.Bucket.List(d.ossPath(path), "", "", listMax)
+		listResponse, err = ioBucket.List(d.ossPath(path), "", "", listMax)
 		if err != nil {
 			return err
 		}
